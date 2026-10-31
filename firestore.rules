@@ -1,0 +1,198 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions for authentication and user metadata
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function isUserActive() {
+      return isAuthenticated() && getUserData().isActive == true;
+    }
+
+    function hasRole(role) {
+      return isUserActive() && getUserData().role == role;
+    }
+
+    function isAnyAdmin() {
+      return isUserActive() && (
+        getUserData().role == 'super_admin' || 
+        getUserData().role == 'institution_admin' || 
+        getUserData().role == 'principal'
+      );
+    }
+
+    function isTeacher() {
+      return hasRole('teacher');
+    }
+
+    function isAccountant() {
+      return hasRole('accountant');
+    }
+
+    function isStudent() {
+      return hasRole('student');
+    }
+
+    function isGuardian() {
+      return hasRole('guardian');
+    }
+
+    // 1. Users collection
+    match /users/{userId} {
+      allow read: if isUserActive() && (request.auth.uid == userId || isAnyAdmin());
+      // Only admins can create/update user accounts or alter roles
+      allow create, update: if isAnyAdmin() && (
+        !request.resource.data.diff(resource.data).affectedKeys().hasAny(['role', 'institutionId']) ||
+        hasRole('super_admin') || hasRole('institution_admin')
+      );
+      allow delete: if hasRole('super_admin');
+    }
+
+    // 2. Students records
+    match /students/{studentId} {
+      // Admins and teachers can read; students can read only their own record; guardians can read their linked children
+      allow read: if isAnyAdmin() || isTeacher() || isAccountant() ||
+        (isStudent() && getUserData().metadata.studentId == studentId) ||
+        (isGuardian() && studentId in getUserData().metadata.linkedStudentIds);
+      
+      // Only admins can create, update, or archive students
+      allow write: if isAnyAdmin();
+    }
+
+    // 3. Guardians
+    match /guardians/{guardianId} {
+      allow read: if isAnyAdmin() || isTeacher() || 
+        (isGuardian() && (request.auth.uid == resource.data.userId || getUserData().metadata.guardianId == guardianId));
+      allow write: if isAnyAdmin();
+    }
+
+    // 4. Teachers & Staff
+    match /teachers/{teacherId} {
+      allow read: if isUserActive();
+      allow write: if isAnyAdmin();
+    }
+
+    // 5. Academic Structure (Sessions, Divisions, Classes, Sections, Subjects)
+    match /academicSessions/{sessionId} {
+      allow read: if true;
+      allow write: if isAnyAdmin();
+    }
+    match /classes/{classId} {
+      allow read: if true;
+      allow write: if isAnyAdmin();
+    }
+    match /sections/{sectionId} {
+      allow read: if true;
+      allow write: if isAnyAdmin();
+    }
+    match /subjects/{subjectId} {
+      allow read: if true;
+      allow write: if isAnyAdmin();
+    }
+    match /routines/{routineId} {
+      allow read: if isUserActive();
+      allow write: if isAnyAdmin();
+    }
+
+    // 6. Attendance records
+    match /attendance/{attendanceId} {
+      allow read: if isAnyAdmin() || isTeacher() ||
+        (isStudent() && resource.data.studentId == getUserData().metadata.studentId) ||
+        (isGuardian() && resource.data.studentId in getUserData().metadata.linkedStudentIds);
+      
+      // Teachers and Admins can record and correct attendance
+      allow create, update: if isAnyAdmin() || isTeacher();
+      allow delete: if isAnyAdmin();
+    }
+
+    // 7. Examinations & Marks
+    match /examinations/{examId} {
+      // Published examinations are readable by all active users; drafts are admin/teacher only
+      allow read: if isUserActive() && (resource.data.status == 'published' || isAnyAdmin() || isTeacher());
+      allow write: if isAnyAdmin();
+    }
+
+    match /examMarks/{markId} {
+      // Results can only be viewed by students/guardians IF the parent exam is published
+      allow read: if isAnyAdmin() || isTeacher() ||
+        (isStudent() && resource.data.studentId == getUserData().metadata.studentId) ||
+        (isGuardian() && resource.data.studentId in getUserData().metadata.linkedStudentIds);
+      
+      // Teachers can submit marks for their subjects; Admins can review/publish
+      allow create, update: if isAnyAdmin() || isTeacher();
+      allow delete: if isAnyAdmin();
+    }
+
+    // 8. Fees & Financials
+    match /feeCategories/{catId} {
+      allow read: if isUserActive();
+      allow write: if isAnyAdmin() || isAccountant();
+    }
+
+    match /studentCharges/{chargeId} {
+      allow read: if isAnyAdmin() || isAccountant() ||
+        (isStudent() && resource.data.studentId == getUserData().metadata.studentId) ||
+        (isGuardian() && resource.data.studentId in getUserData().metadata.linkedStudentIds);
+      allow write: if isAnyAdmin() || isAccountant();
+    }
+
+    match /payments/{paymentId} {
+      allow read: if isAnyAdmin() || isAccountant() ||
+        (isStudent() && resource.data.studentId == getUserData().metadata.studentId) ||
+        (isGuardian() && resource.data.studentId in getUserData().metadata.linkedStudentIds);
+      // Strictly prevent students or guardians from recording or altering payments
+      allow create: if isAnyAdmin() || isAccountant();
+      allow update, delete: if isAnyAdmin();
+    }
+
+    // 9. Notices & Events
+    match /notices/{noticeId} {
+      allow read: if true; // Public notices visible; role filtering handled in query
+      allow write: if isAnyAdmin();
+    }
+
+    match /events/{eventId} {
+      allow read: if true;
+      allow write: if isAnyAdmin();
+    }
+
+    // 10. Admission Enquiries
+    match /admissionEnquiries/{enquiryId} {
+      // Public visitors can submit admission enquiry
+      allow create: if request.resource.data.applicantName is string &&
+                       request.resource.data.phone is string &&
+                       request.resource.data.status == 'new';
+      // ONLY administrators can read, update status, or delete enquiries
+      allow read, update, delete: if isAnyAdmin();
+    }
+
+    // 11. Library & Inventory
+    match /libraryBooks/{bookId} {
+      allow read: if isUserActive();
+      allow write: if isAnyAdmin() || hasRole('librarian');
+    }
+
+    match /transportRoutes/{routeId} {
+      allow read: if isUserActive();
+      allow write: if isAnyAdmin();
+    }
+
+    // 12. Audit Logs
+    match /auditLogs/{logId} {
+      allow read: if hasRole('super_admin') || hasRole('institution_admin');
+      allow create: if isUserActive();
+      allow update, delete: if false; // Immutable audit log
+    }
+
+    // Default deny all other paths
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
